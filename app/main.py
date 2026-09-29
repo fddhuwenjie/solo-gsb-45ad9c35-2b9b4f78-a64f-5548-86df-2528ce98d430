@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from . import demand, diff, importer, meter, pricing, shiftplan
+from . import allocation, demand, diff, importer, meter, pricing, shiftplan
 from .database import engine, init_db
 from .pricing import (
     Q2,
@@ -19,6 +19,9 @@ from .pricing import (
     validate_version,
 )
 from .schemas import (
+    AllocationMemberOut,
+    CostAllocationRequest,
+    CostAllocationResponse,
     DemandAllocationOut,
     DemandChargeRequest,
     DemandChargeResponse,
@@ -326,6 +329,42 @@ def post_demand_charge(req: DemandChargeRequest):
         reason_code=result.reason_code,
         reason=result.reason,
         excluded_windows=excluded,
+    )
+
+
+@app.post("/cost-allocation", response_model=CostAllocationResponse,
+          tags=["quote"])
+def post_cost_allocation(req: CostAllocationRequest):
+    """共享电表下多成员阶梯电费的公平拆分（Shapley 值）。
+
+    取全部成员全部区间的 UTC 端点并集切成原子段，能量按实际时长分摊后
+    在每个原子段上合并同段负荷，再复用计价引擎对所有 2^n 个联盟精确
+    报价；每名成员的归属额为其全部加入顺序下边际增费的平均值。归属金额
+    按输入顺序量化到六位小数，末位成员取全体费用减去前项之和，合计严格
+    等于全体合并报价。
+    """
+    with Session(engine) as session:
+        version = load_version(session, req.version)
+        result = allocation.allocate(version, req)
+
+    return CostAllocationResponse(
+        version=version.code,
+        currency=version.currency,
+        energy_unit=version.energy_unit,
+        total_energy=str(result.total_energy),
+        total_amount=str(result.total_amount),
+        coalitions_evaluated=result.coalitions_evaluated,
+        members=[
+            AllocationMemberOut(
+                member_index=m.index,
+                member_id=m.member_id,
+                energy=str(m.energy),
+                standalone_amount=str(m.standalone_amount.quantize(Q6)),
+                allocated_amount=str(m.allocated_amount.quantize(Q6)),
+                difference=str(m.difference.quantize(Q6)),
+            )
+            for m in result.members
+        ],
     )
 
 

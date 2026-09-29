@@ -132,6 +132,69 @@ class VersionOut(BaseModel):
     rules: list[RuleOut]
 
 
+# ------------------------------------------------------------- cost allocation
+
+
+class AllocationMemberIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    member_id: str = Field(
+        ..., min_length=1,
+        description="用能方唯一标识（非空字符串），成员之间不得重复",
+    )
+    intervals: list[QuoteIntervalIn] = Field(
+        ..., min_length=1,
+        description="与 /quote 相同的用量区间格式；同一成员内部区间不得"
+        "重叠，不同成员之间允许重叠",
+    )
+
+
+class CostAllocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = Field(..., description="规则版本号，如 us-ny-demo-v2024")
+    members: list[AllocationMemberIn] = Field(
+        ..., min_length=2, max_length=6,
+        description="2～6 名共享电表后的用能方，按输入顺序编号；归属金额"
+        "也按此顺序量化，最后一名吸收舍入残差",
+    )
+
+
+class AllocationMemberOut(BaseModel):
+    member_index: int = Field(..., description="成员在请求 members 中的下标（0 起）")
+    member_id: str
+    energy: str = Field(
+        ..., description="该成员申报用量（精确值），等于其各原子段分摊能量之和"
+    )
+    standalone_amount: str = Field(
+        ..., description="独立报价 v({i})：仅该成员用能时的费用（六位小数）"
+    )
+    allocated_amount: str = Field(
+        ..., description="Shapley 归属金额（六位小数）；全体成员之和严格"
+        "等于 total_amount"
+    )
+    difference: str = Field(
+        ..., description="standalone_amount − allocated_amount（六位小数）；"
+        "正值表示合并后少付，负值表示为阶梯叠加承担更多"
+    )
+
+
+class CostAllocationResponse(BaseModel):
+    version: str
+    currency: str
+    energy_unit: str
+    total_energy: str = Field(
+        ..., description="全体成员用量之和，等于合并报价的总用量"
+    )
+    total_amount: str = Field(
+        ..., description="全体成员合并报价 v(N)（六位小数）"
+    )
+    coalitions_evaluated: int = Field(
+        ..., description="枚举的联盟总数 2^n（含费用为 0 的空联盟）"
+    )
+    members: list[AllocationMemberOut]
+
+
 # ------------------------------------------------------------- version import
 
 
