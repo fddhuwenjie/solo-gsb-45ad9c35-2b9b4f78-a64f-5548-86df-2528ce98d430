@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from . import demand, diff, importer, meter, pricing, shiftplan
+from . import allocation, demand, diff, importer, meter, pricing, shiftplan
 from .database import engine, init_db
 from .pricing import (
     Q2,
@@ -19,6 +19,9 @@ from .pricing import (
     validate_version,
 )
 from .schemas import (
+    CostAllocationMemberOut,
+    CostAllocationRequest,
+    CostAllocationResponse,
     DemandAllocationOut,
     DemandChargeRequest,
     DemandChargeResponse,
@@ -326,6 +329,42 @@ def post_demand_charge(req: DemandChargeRequest):
         reason_code=result.reason_code,
         reason=result.reason,
         excluded_windows=excluded,
+    )
+
+
+@app.post("/cost-allocation", response_model=CostAllocationResponse,
+          tags=["quote"])
+def post_cost_allocation(req: CostAllocationRequest):
+    """共享电表下多个用能方的阶梯电费公平拆分（Shapley 值）。
+
+    以全部成员区间的 UTC 端点切成原子段，按实际时长分摊各方用量、叠加
+    同段负荷，复用计价引擎对全部成员联盟精确报价（空联盟为 0）；各方
+    归属额为其在所有加入顺序中的边际增费平均值。归属金额按输入顺序
+    量化到六位小数、末名兜底，之和严格等于全体合并报价。
+    """
+    with Session(engine) as session:
+        version = load_version(session, req.version)
+        result = allocation.allocate(version, req)
+
+    members_out = [
+        CostAllocationMemberOut(
+            member_id=m.id,
+            energy=str(m.energy),
+            standalone_amount=str(m.standalone_amount.quantize(Q6)),
+            allocated_amount=str(m.allocated_amount.quantize(Q6)),
+            amount_diff=str((m.standalone_amount - m.allocated_amount)
+                            .quantize(Q6)),
+        )
+        for m in result.members
+    ]
+    return CostAllocationResponse(
+        version=version.code,
+        currency=version.currency,
+        energy_unit=version.energy_unit,
+        total_energy=str(result.total_energy.quantize(Q6)),
+        total_amount=str(result.total_amount.quantize(Q6)),
+        coalition_count=result.coalition_count,
+        members=members_out,
     )
 
 

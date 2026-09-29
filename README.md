@@ -605,6 +605,86 @@ curl -s -X POST localhost:8000/demand-charge -H 'Content-Type: application/json'
 200，`selected_window` 为 `null`、`demand_kw`/`amount` 为 `0.000000`，
 并给出 `reason_code="no_complete_window"`（`interval_shares` 仍正常返回）。
 
+### `POST /cost-allocation`
+
+为**共享一块总表**的多个用能方（2～6 个 ID 唯一的成员）公平拆分
+**分时阶梯电费**（纯计算，规则版本取自数据库）。累计阶梯由总表全部负荷
+共同穿越，任一方的边际费用取决于还有哪些成员同时在网，因此归属额取
+**Shapley 值**——每名成员在所有加入顺序中的**边际增费平均值**。
+
+请求示例（服务端口 **8000**）：
+
+```bash
+curl -s -X POST localhost:8000/cost-allocation -H 'Content-Type: application/json' -d '{
+  "version": "us-ny-demo-v2024",
+  "members": [
+    {"id": "shop-A", "intervals": [
+      {"start": "2024-07-06T12:00:00-04:00", "end": "2024-07-06T13:00:00-04:00",
+       "timezone": "America/New_York", "energy": 80}]},
+    {"id": "shop-B", "intervals": [
+      {"start": "2024-07-06T12:00:00-04:00", "end": "2024-07-06T13:00:00-04:00",
+       "timezone": "America/New_York", "energy": 40}]},
+    {"id": "cafe-C", "intervals": [
+      {"start": "2024-07-06T12:00:00-04:00", "end": "2024-07-06T13:00:00-04:00",
+       "timezone": "America/New_York", "energy": 30}]}
+  ]
+}'
+```
+
+- `members`：**2～6 个**成员，`id` 在请求内唯一；每名成员携带一组与
+  `/quote` **完全同格式**的用量区间。同一成员**内部**区间不得重叠
+  （400 `interval_overlap`，错误详情带 `member_id`）；**成员之间允许
+  重叠**——重叠时段各方同时用能，总表负荷为各方之和。
+- 服务端收集全部成员区间的 **UTC 端点**排序去重，切成**原子段**
+  （段内活跃成员集合不变）；每个成员在其覆盖的原子段内按**实际 UTC
+  时长（微秒）比例**分摊自己的申报能量，六位小数四舍五入、残差并入该
+  区间最后一个原子段，因此逐成员**严格能量守恒**。
+- 任一成员联盟的负荷 = 各原子段内联盟成员分摊量之和（重叠即叠加），
+  随后**复用 `/quote` 计价引擎**对该联盟整体报价，累计阶梯跨成员共享。
+- **精确枚举全部 `2^n` 个联盟**（空联盟费用为 0，不调用引擎）；Shapley
+  均值以精确有理数（`Fraction`）累积，仅在最后四舍五入到**六位小数**。
+- 归属金额按**输入顺序**逐项量化到六位小数，**最后一名取全体合并报价
+  减去前项之和**，因此各成员归属金额之和**严格等于总表账单**。
+
+响应：
+
+```json
+{
+  "version": "us-ny-demo-v2024",
+  "currency": "USD",
+  "energy_unit": "kWh",
+  "total_energy": "150.000000",
+  "total_amount": "24.000000",
+  "coalition_count": 8,
+  "members": [
+    {"member_id": "shop-A", "energy": "80",
+     "standalone_amount": "12.000000",
+     "allocated_amount": "12.650000", "amount_diff": "-0.650000"},
+    {"member_id": "shop-B", "energy": "40",
+     "standalone_amount": "6.000000",
+     "allocated_amount": "6.500000", "amount_diff": "-0.500000"},
+    {"member_id": "cafe-C", "energy": "30",
+     "standalone_amount": "4.500000",
+     "allocated_amount": "4.850000", "amount_diff": "-0.350000"}
+  ]
+}
+```
+
+- `total_energy` / `total_amount`：全体成员负荷之和与其**合并报价**
+  （六位小数，即总表账单；为引擎逐段六位小数金额之和，不像 `/quote`
+  那样再抹到分）。
+- 每名成员给出申报用量 `energy`、**独立报价** `standalone_amount`
+  （只有该成员时的六位小数报价）、**Shapley 归属金额**
+  `allocated_amount`，以及二者差额 `amount_diff =
+  standalone_amount − allocated_amount`（**正数表示合并后少付**、
+  负数表示因把联盟推入更高阶梯而多摊）。
+- 成员的区间可以跨过规则边界（工作日/周末、DST 跳时等）：原子段只在
+  成员端点切分，更细的规则切分仍由计价引擎在联盟报价时完成，分摊
+  规则与 `/quote`、`/demand-charge` 一致，DST 日自然按 23/25 小时计。
+- 版本存在结构错误直接 **409 `rule_conflict`**；任一联盟的负荷区间内
+  存在规则缺口则 **409 `rule_gap`**；成员 `id` 重复返回
+  **400 `duplicate_member`**。
+
 ### `POST /versions/import`
 
 导入一个**完整费率版本**（版本 + 嵌套的 `holidays`、`rules`、`tiers`），
@@ -693,6 +773,7 @@ curl -s -X POST localhost:8000/versions/import -H 'Content-Type: application/jso
 | POST | `/shift-plan` | 两项可移时任务在 8 小时窗口内枚举 30 分钟候选，统一报价选最低费用组合（见上） |
 | POST | `/meter-readings/reconcile` | 累计表计读数对账：排序去重、reset 断列、回卷与采样间隔 gap，产出可直提 `/quote` 的用量区间（见上） |
 | POST | `/demand-charge` | 不等长用量区间按本地午夜对齐的 15/30/60 分钟窗口结算最大需量：DST 感知枚举、按实际时长精确分摊、逐输入能量守恒、逐输入全窗口切片对账（见上） |
+| POST | `/cost-allocation` | 共享电表 2～6 个用能方的阶梯电费 Shapley 拆分：UTC 端点原子段、按实际时长分摊叠加负荷、全联盟精确枚举、六位小数归属严格等于总表账单（见上） |
 
 ## 错误处理
 
@@ -705,7 +786,8 @@ curl -s -X POST localhost:8000/versions/import -H 'Content-Type: application/jso
 | 400 | `invalid_timezone` / `invalid_datetime` / `invalid_interval` | 时区、时间格式或区间非法（end ≤ start、能量 ≤ 0） |
 | 400 | `offset_required` | `/shift-plan` 的任务窗口或 `/meter-readings/reconcile` 的读数/reset 时刻未携带 UTC 偏移量 |
 | 400 | `window_too_large` / `duration_exceeds_window` | `/shift-plan` 任务可用窗口超过 8 小时，或持续时长超出可用窗口 |
-| 400 | `interval_overlap` | 输入的多个用量区间相互重叠 |
+| 400 | `interval_overlap` | 输入的多个用量区间相互重叠（`/cost-allocation` 中同一成员的区间重叠；成员之间允许重叠） |
+| 400 | `duplicate_member` | `/cost-allocation` 的成员 ID 在请求内重复 |
 | 400 | `reading_out_of_range` | `/meter-readings/reconcile` 的读数值不在 `[0, modulus)` 内 |
 | 400 | `conflicting_readings` | 同一时刻出现数值不一致的两条读数 |
 | 400 | `reset_not_on_reading` | `resets` 中的时刻没有命中任何读数 |
@@ -763,7 +845,7 @@ pip install pytest httpx
 python -m pytest -q
 ```
 
-测试使用内存 SQLite（`StaticPool`），共 111 个用例，覆盖跨日、春秋 DST、
+测试使用内存 SQLite（`StaticPool`），共 133 个用例，覆盖跨日、春秋 DST、
 节假日/调休、跨档切分、重叠与缺口报错、版本对比（原子段对账、
 rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选枚举、
 跨任务共享累计阶梯、同价字典序决胜、规则缺口只淘汰对应候选、
@@ -778,7 +860,12 @@ rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选�
 `interval_shares` 逐输入全窗口切片分组（普通跨窗、DST、无完整窗口
 场景下各组能量和严格等于原输入）、同功率取最早 UTC 起点、
 首尾相接连续覆盖、边缘/缺口窗口原因、六位小数计费、
-无完整窗口的 `no_complete_window` 与全部输入校验路径。
+无完整窗口的 `no_complete_window` 与全部输入校验路径，
+以及 `/cost-allocation` 的成员内部区间重叠/跨成员重叠允许、
+UTC 端点原子段按实际时长分摊（跨规则边界、多区间能量守恒、DST 跳时）、
+全部联盟枚举与 Shapley 归属（对称/非对称手算值、与独立排列枚举 oracle
+逐项一致、末名残差兜底使归属严格等于全体报价）、独立报价与
+`/quote` 逐段金额对账、成员数量/重复 ID/规则缺口等校验路径。
 
 ## 目录结构
 
@@ -791,6 +878,7 @@ app/
   shiftplan.py  # 移时排程：30 分钟枚举 + 统一报价选优
   meter.py      # 表计对账：排序去重、reset 断列、回卷与采样间隔 gap
   demand.py     # 最大需量：本地午夜对齐窗口、DST 枚举、精确分摊与选优
+  allocation.py # 共享电表费用拆分：原子段分摊、全联盟报价、Shapley 归属
   importer.py   # 版本导入：规范化、SHA-256 摘要、定位校验、单事务落库
   database.py   # SQLAlchemy 模型与预置版本数据
 tests/          # pytest 端到端测试

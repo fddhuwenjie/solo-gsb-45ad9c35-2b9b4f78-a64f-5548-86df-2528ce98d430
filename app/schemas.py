@@ -504,3 +504,62 @@ class DemandChargeResponse(BaseModel):
     reason: str | None
     excluded_windows: list[ExcludedWindowOut]
 
+
+# ------------------------------------------------------- cost allocation
+
+
+class CostAllocationMemberIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(
+        ..., min_length=1,
+        description="用能方唯一标识（成员之间不得重复）",
+    )
+    intervals: list[QuoteIntervalIn] = Field(
+        ..., min_length=1,
+        description="该成员的用量区间，与 /quote 同格式；同一成员内部"
+        "区间不得重叠，不同成员之间允许重叠",
+    )
+
+
+class CostAllocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = Field(..., description="规则版本号，如 us-ny-demo-v2024")
+    members: list[CostAllocationMemberIn] = Field(
+        ..., min_length=2, max_length=6,
+        description="2～6 个 ID 唯一的用能方，按输入顺序量化归属金额",
+    )
+
+
+class CostAllocationMemberOut(BaseModel):
+    member_id: str = Field(..., description="回显请求中的成员 ID")
+    energy: str = Field(..., description="该成员申报用量合计（精确值）")
+    standalone_amount: str = Field(
+        ..., description="该成员单独按总表费率报价的费用（六位小数）"
+    )
+    allocated_amount: str = Field(
+        ..., description="Shapley 归属金额（六位小数；各成员之和严格等于"
+        "全体合并报价）"
+    )
+    amount_diff: str = Field(
+        ..., description="差额 = 独立报价 − 归属金额（六位小数；"
+        "正数表示合并后少付）"
+    )
+
+
+class CostAllocationResponse(BaseModel):
+    version: str
+    currency: str
+    energy_unit: str
+    total_energy: str = Field(
+        ..., description="全体成员申报用量之和（即总表全部负荷）"
+    )
+    total_amount: str = Field(
+        ..., description="全体成员负荷合并报价（六位小数，即总表账单）"
+    )
+    coalition_count: int = Field(
+        ..., description="枚举的联盟总数（含空联盟，恒为 2^成员数）"
+    )
+    members: list[CostAllocationMemberOut]
+
